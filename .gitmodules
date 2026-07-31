@@ -1,0 +1,3 @@
+[submodule "qwen3-tts-c"]
+	path = qwen3-tts-c
+	url = https://github.com/tardigrade-dot/qwen3-tts-c

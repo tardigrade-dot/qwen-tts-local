@@ -1,0 +1,11 @@
+
+[package]
+name = "qwen-tts-local"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "qwen3-tts-local"
+path = "src/main.rs"
+
+[dependencies]
