@@ -7,6 +7,10 @@ fn main() {
     let glue_dir = manifest_dir.join("glue");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
     let mut build = cc::Build::new();
 
     build
@@ -16,10 +20,28 @@ fn main() {
         .flag("-Wall")
         .flag("-Wextra")
         .flag("-O3")
-        .flag("-march=native")
-        .flag("-ffast-math")
-        .define("USE_BLAS", None)
-        .define("ACCELERATE_NEW_LAPACK", None)
+        .define("USE_BLAS", None);
+
+    // Architecture-specific flags
+    if target_os == "darwin" {
+        build.flag("-march=native");
+        build.flag("-ffast-math");
+        build.define("ACCELERATE_NEW_LAPACK", None);
+    } else if target_arch == "x86_64" || target_arch == "x86" {
+        // Linux/Windows x86_64: use AVX2+FMA by default (Haswell 2013+)
+        if target_env == "msvc" {
+            build.flag("/arch:AVX2");
+        } else {
+            build.flag("-mavx2");
+            build.flag("-mfma");
+            build.flag("-ffast-math");
+        }
+    } else if target_arch == "aarch64" {
+        build.flag("-march=native");
+        build.flag("-ffast-math");
+    }
+
+    build
         .file(c_dir.join("qwen_tts.c"))
         .file(c_dir.join("qwen_tts_talker.c"))
         .file(c_dir.join("qwen_tts_code_predictor.c"))
@@ -48,14 +70,43 @@ fn main() {
         .flag("-Wall")
         .flag("-Wextra")
         .flag("-O3")
-        .flag("-march=native")
-        .define("USE_BLAS", None)
-        .define("ACCELERATE_NEW_LAPACK", None)
+        .define("USE_BLAS", None);
+
+    if target_os == "darwin" {
+        speech_enc_build.flag("-march=native");
+        speech_enc_build.define("ACCELERATE_NEW_LAPACK", None);
+    } else if target_arch == "x86_64" || target_arch == "x86" {
+        if target_env == "msvc" {
+            speech_enc_build.flag("/arch:AVX2");
+        } else {
+            speech_enc_build.flag("-mavx2");
+            speech_enc_build.flag("-mfma");
+        }
+    } else if target_arch == "aarch64" {
+        speech_enc_build.flag("-march=native");
+    }
+
+    speech_enc_build
         .file(c_dir.join("qwen_tts_speech_encoder.c"))
         .compile("qwen_tts_speech_encoder");
 
-    println!("cargo:rustc-link-lib=framework=Accelerate");
-    println!("cargo:rustc-link-lib=framework=Foundation");
+    // Link libraries based on platform
+    if target_os == "darwin" {
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    } else if target_os == "linux" {
+        println!("cargo:rustc-link-lib=openblas");
+        println!("cargo:rustc-link-lib=m");
+        println!("cargo:rustc-link-lib=pthread");
+        // OpenBLAS include path may vary by distro
+        if PathBuf::from("/usr/include/openblas").exists() {
+            println!("cargo:rustc-link-search=native=/usr/lib/openblas");
+        }
+    } else if target_os == "windows" {
+        // Windows: link openblas.lib (user must provide via vcpkg or manual install)
+        println!("cargo:rustc-link-lib=openblas");
+        println!("cargo:rustc-link-lib=ws2_32");  // for networking if needed
+    }
 
     let bindings = bindgen::Builder::default()
         .clang_arg(format!("-I{}", c_dir.display()))

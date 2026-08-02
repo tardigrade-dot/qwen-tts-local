@@ -3,21 +3,26 @@ use crate::ffi;
 use crate::audio;
 use anyhow::Result;
 use axum::{
+    body::Body,
     extract::State,
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
+use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::Mutex;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<ServerConfig>,
-    pub ctx: Arc<Mutex<Option<ffi::RawCtx>>>,
-}
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use std::pin::Pin;
+use futures_util::stream::StreamExt;
+use bytes::Bytes;
+use axum::body::BoxBody;
+use axum::response::BodyStream;
+use std::task::{Context, Poll};
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -28,8 +33,101 @@ pub struct ServerConfig {
     pub ref_audio_path: Option<String>,
     pub ref_text: Option<String>,
     pub voice_clone: bool,
-    #[allow(dead_code)]
     pub idle_secs: Option<u64>,
+}
+
+/// Model manager with idle unload support and request tracking
+pub struct ModelManager {
+    ctx: Option<ffi::RawCtx>,
+    last_used: Instant,
+    idle_secs: Option<u64>,
+    busy: bool,
+    /// Map of request_id -> cancel sender for active streaming requests
+    active_requests: std::collections::HashMap<String, oneshot::Sender<()>>,
+}
+
+unsafe impl Send for ModelManager {}
+unsafe impl Sync for ModelManager {}
+
+impl ModelManager {
+    pub fn new(idle_secs: Option<u64>) -> Self {
+        Self {
+            ctx: None,
+            last_used: Instant::now(),
+            idle_secs,
+            busy: false,
+            active_requests: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn get_or_load(&mut self, config: &ServerConfig) -> Result<ffi::RawCtx> {
+        if let Some(raw) = self.ctx {
+            self.last_used = Instant::now();
+            return Ok(raw);
+        }
+        let ctx = unsafe {
+            ffi::Context::load(
+                &config.model_dir,
+                config.silent,
+                config.use_int8,
+                config.use_int4,
+            )
+        };
+        let ctx = ctx.ok_or_else(|| anyhow::anyhow!("Failed to load model"))?;
+        let ptr = ctx.as_ptr();
+        std::mem::forget(ctx);
+        self.ctx = Some(ffi::RawCtx(ptr));
+        self.last_used = Instant::now();
+        Ok(ffi::RawCtx(ptr))
+    }
+
+    pub fn mark_busy(&mut self) {
+        self.busy = true;
+    }
+
+    pub fn mark_idle(&mut self) {
+        self.busy = false;
+        self.last_used = Instant::now();
+    }
+
+    pub fn should_unload(&self) -> bool {
+        if let Some(secs) = self.idle_secs {
+            !self.busy && self.last_used.elapsed() > Duration::from_secs(secs)
+        } else {
+            false
+        }
+    }
+
+    pub fn unload(&mut self) {
+        if let Some(raw) = self.ctx.take() {
+            unsafe {
+                ffi::Context::cleanup_raw(raw.0);
+            }
+        }
+    }
+
+    pub fn register_request(&mut self, request_id: String, tx: oneshot::Sender<()>) {
+        self.active_requests.insert(request_id, tx);
+    }
+
+    pub fn unregister_request(&mut self, request_id: &str) {
+        self.active_requests.remove(request_id);
+    }
+
+    pub fn cancel_request(&mut self, request_id: &str) -> bool {
+        if let Some(tx) = self.active_requests.remove(request_id) {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<ServerConfig>,
+    pub manager: Arc<Mutex<ModelManager>>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +151,8 @@ struct TtsRequest {
     _model: Option<String>,
     #[serde(rename = "response_format")]
     _response_format: Option<String>,
+    #[serde(rename = "request_id")]
+    request_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -100,8 +200,8 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let guard = state.ctx.lock().unwrap();
-    let loaded = guard.is_some();
+    let guard = state.manager.lock().unwrap();
+    let loaded = guard.ctx.is_some();
     drop(guard);
     Json(serde_json::json!({
         "status": "ok",
@@ -142,6 +242,21 @@ async fn tts_full(
     }
 }
 
+/// Streaming audio chunk for axum response
+pub struct AudioChunk {
+    data: Bytes,
+}
+
+impl IntoResponse for AudioChunk {
+    fn into_response(self) -> Response {
+        (
+            [(header::CONTENT_TYPE, "audio/pcm"), ("X-Sample-Rate", "24000"), ("X-Sample-Format", "s16le"), ("X-Channels", "1")],
+            self.data
+        ).into_response()
+    }
+}
+
+/// True streaming response using C callback with Axum StreamBody
 async fn tts_stream(
     State(state): State<AppState>,
     Json(req): Json<TtsRequest>,
@@ -162,13 +277,26 @@ async fn tts_stream(
             .into_response();
     }
 
+    let request_id = req.request_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let config = state.config.clone();
+    let manager = state.manager.clone();
     let params = build_params(&config, &req, text);
-    let ctx_arc = state.ctx.clone();
 
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let mut guard = ctx_arc.lock().unwrap();
-        let raw_ctx = ensure_loaded_sync(&config, &mut guard)?;
+    // Create channel for streaming audio chunks
+    let (tx, mut rx) = mpsc::channel::<Result<Vec<u8>>>(32);
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+    // Register request for cancellation
+    {
+        let mut mgr = manager.lock().unwrap();
+        mgr.register_request(request_id.clone(), cancel_tx);
+        mgr.mark_busy();
+    }
+
+    // Spawn blocking task for synthesis
+    let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut mgr = manager.lock().unwrap();
+        let raw_ctx = mgr.get_or_load(&config)?;
         let ctx_ptr = raw_ctx.0;
 
         unsafe {
@@ -183,32 +311,183 @@ async fn tts_stream(
             }
         }
 
-        let pcm = if has_markup(&params.text) {
-            generate_compose_full(ctx_ptr, &params)?
-        } else {
-            generate_normal_full(ctx_ptr, &params.text)?
-        };
-        drop(guard);
-
-        Ok(audio::f32_to_s16le(&pcm))
-    })
-    .await;
-
-    match result {
-        Ok(Ok(data)) => {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, "audio/pcm".parse().unwrap());
-            headers.insert("X-Sample-Rate", "24000".parse().unwrap());
-            headers.insert("X-Sample-Format", "s16le".parse().unwrap());
-            headers.insert("X-Channels", "1".parse().unwrap());
-            (StatusCode::OK, headers, data).into_response()
+        // Set up streaming callback that sends to channel
+        struct ChannelCbData {
+            tx: Mutex<mpsc::Sender<Result<Vec<u8>>>>,
+            cancel_rx: Mutex<Option<oneshot::Receiver<()>>>,
         }
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "Generation failed"})),
-        )
-            .into_response(),
-    }
+
+        unsafe extern "C" fn stream_cb(
+            samples: *const f32,
+            n_samples: i32,
+            userdata: *mut std::os::raw::c_void,
+        ) -> i32 {
+            if userdata.is_null() {
+                return 0;
+            }
+            let data = &*(userdata as *const ChannelCbData);
+
+            // Check for cancel signal
+            if let Ok(mut rx_opt) = data.cancel_rx.lock() {
+                if let Some(rx) = rx_opt.as_mut() {
+                    if rx.try_recv().is_ok() {
+                        return 1; // Signal abort
+                    }
+                }
+            }
+
+            if n_samples > 0 && !samples.is_null() {
+                let slice = std::slice::from_raw_parts(samples, n_samples as usize);
+                let pcm = audio::f32_to_s16le(slice);
+                if let Ok(tx) = data.tx.lock() {
+                    if tx.blocking_send(Ok(pcm)).is_err() {
+                        return 1; // Channel closed, abort
+                    }
+                } else {
+                    return 1;
+                }
+            }
+            0
+        }
+
+        let cb_data = Box::new(ChannelCbData {
+            tx: Mutex::new(tx),
+            cancel_rx: Mutex::new(Some(cancel_rx)),
+        });
+        let cb_data_ptr = Box::into_raw(cb_data);
+
+        unsafe {
+            qwen_ctx_set_stream(ctx_ptr, 1);
+            qwen_ctx_set_stream_chunk_frames(ctx_ptr, 10);
+            qwen_tts_set_audio_callback(
+                ctx_ptr,
+                Some(stream_cb),
+                cb_data_ptr as *mut std::os::raw::c_void,
+            );
+        }
+
+        // Generate based on markup or plain text
+        let ret = if has_markup(&params.text) {
+            // Compose streaming
+            let c_text = std::ffi::CString::new(params.text.as_str()).unwrap();
+            let c_lang = std::ffi::CString::new(lang_id_to_name(params.language_id)).unwrap();
+
+            let mut spans: *mut qwen_cspan_t = std::ptr::null_mut();
+            let mut n_spans: i32 = 0;
+            let parse_ret = unsafe {
+                qwen_compose_parse(
+                    c_text.as_ptr() as *const std::os::raw::c_char,
+                    &mut spans as *mut *mut qwen_cspan_t,
+                    &mut n_spans as *mut i32,
+                )
+            };
+            if parse_ret != 0 {
+                unsafe {
+                    let _ = Box::from_raw(cb_data_ptr);
+                }
+                return Err(anyhow::anyhow!("Compose parse failed"));
+            }
+
+            unsafe {
+                qwen_compose_render_stream(
+                    ctx_ptr,
+                    spans,
+                    n_spans,
+                    c_lang.as_ptr() as *const std::os::raw::c_char,
+                    0.5,
+                    None, /* chunk_cb not used - we use audio_callback */
+                    std::ptr::null_mut(),
+                    0,
+                )
+            }
+        } else {
+            unsafe {
+                qwen_tts_generate(
+                    ctx_ptr,
+                    std::ffi::CString::new(params.text.as_str()).unwrap().as_ptr() as *const std::os::raw::c_char,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+
+        unsafe {
+            qwen_ctx_clear_audio_callback(ctx_ptr);
+            let _ = Box::from_raw(cb_data_ptr);
+        }
+
+        if ret != 0 {
+            return Err(anyhow::anyhow!("Generation failed with code {}", ret));
+        }
+
+        Ok(())
+    });
+
+    // Build streaming response body
+    let headers = HeaderMap::new();
+    let stream = async_stream::stream! {
+        loop {
+            tokio::select! {
+                chunk = rx.recv() => {
+                    match chunk {
+                        Some(Ok(data)) => yield Ok::<_, anyhow::Error>(data),
+                        Some(Err(e)) => {
+                            yield Err(e);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                _ = handle => {
+                    break;
+                }
+            }
+        }
+    };
+
+    // Unregister and mark idle when done
+    let manager_clone = manager.clone();
+    let request_id_clone = request_id.clone();
+    let stream_with_cleanup = async_stream::stream! {
+        let mut s = Box::pin(stream);
+        while let Some(item) = s.next().await {
+            yield item;
+        }
+        // Cleanup after stream completes
+        let mut mgr = manager_clone.lock().unwrap();
+        mgr.unregister_request(&request_id_clone);
+        mgr.mark_idle();
+    };
+
+    use axum::body::{Body, HttpBody};
+    use http_body_util::{StreamBody, Frame};
+
+    let body = Body::from_stream(async_stream::stream! {
+        let mut s = Box::pin(stream);
+        while let Some(item) = s.next().await {
+            match item {
+                Ok(data) => yield Ok(Frame::data(Bytes::from(data))),
+                Err(e) => yield Ok(Frame::data(Bytes::from(format!("Error: {}", e)))),
+            }
+        }
+    });
+
+    // Cleanup task
+    let cleanup_manager = manager.clone();
+    tokio::spawn(async move {
+        let _ = handle.await;
+        let mut mgr = cleanup_manager.lock().unwrap();
+        mgr.unregister_request(&request_id);
+        mgr.mark_idle();
+    });
+
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(header::CONTENT_TYPE, "audio/pcm".parse().unwrap());
+    resp_headers.insert("X-Sample-Rate", "24000".parse().unwrap());
+    resp_headers.insert("X-Sample-Format", "s16le".parse().unwrap());
+    resp_headers.insert("X-Channels", "1".parse().unwrap());
+
+    (StatusCode::OK, resp_headers, body).into_response()
 }
 
 async fn tts_openai(
@@ -229,11 +508,12 @@ async fn synthesize_full(state: &AppState, req: TtsRequest) -> Result<Vec<u8>> {
 
     let params = build_params(&state.config, &req, text);
     let config = state.config.clone();
-    let ctx_arc = state.ctx.clone();
+    let manager = state.manager.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let mut guard = ctx_arc.lock().unwrap();
-        let raw_ctx = ensure_loaded_sync(&config, &mut guard)?;
+        let mut mgr = manager.lock().unwrap();
+        mgr.mark_busy();
+        let raw_ctx = mgr.get_or_load(&config)?;
         let ctx_ptr = raw_ctx.0;
 
         unsafe {
@@ -282,6 +562,7 @@ async fn synthesize_full(state: &AppState, req: TtsRequest) -> Result<Vec<u8>> {
             }
         }
 
+        mgr.mark_idle();
         Ok(audio::build_wav_in_memory(&pcm))
     })
     .await??;
@@ -612,4 +893,18 @@ pub fn lang_id_to_name(id: i32) -> &'static str {
         2070 => "Italian",
         _ => "English",
     }
+}
+
+/// Start idle unload background task
+pub fn spawn_idle_unload_task(manager: Arc<Mutex<ModelManager>>, check_interval_secs: u64) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(check_interval_secs)).await;
+            let mut mgr = manager.lock().unwrap();
+            if mgr.should_unload() {
+                eprintln!("[ModelManager] Unloading model due to idle timeout");
+                mgr.unload();
+            }
+        }
+    })
 }
